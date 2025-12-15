@@ -1,0 +1,5 @@
+{
+  "name": "Social Media Data Extractor",
+  "description": "An OCR and data extraction tool specialized for social media analytics screenshots, converting images to Excel-ready TSV format.",
+  "requestFramePermissions": []
+}
