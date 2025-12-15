@@ -1,3 +1,4 @@
+
 export interface ProcessedResult {
   rawText: string;
   parsedData: ParsedRow[];
@@ -7,13 +8,13 @@ export interface ParsedRow {
   username: string;
   link: string;
   followers: string;
-  views: number;
+  views: string;       // Changed to string to support "7.89万"
+  numericViews: number; // Helper for charts/sorting
   contentType: string;
-  tags: string;
-  region: string;
-  malePct: string;   // New: Male Audience Percentage
-  femalePct: string; // New: Female Audience Percentage
-  ageDist: string;   // New: Age Distribution
+  niche: string;
+  language: string;
+  genderDist: string;
+  ageDist: string;
 }
 
 export interface UploadFile {

@@ -3,6 +3,16 @@ import { SYSTEM_PROMPT } from "../constants";
 import * as mammoth from "mammoth";
 import * as XLSX from "xlsx";
 
+interface ExtractedData {
+  text: string;
+  images: Array<{
+    inlineData: {
+      mimeType: string;
+      data: string;
+    }
+  }>;
+}
+
 const getBase64 = (file: File): Promise<string> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -17,10 +27,38 @@ const getBase64 = (file: File): Promise<string> => {
   });
 };
 
-const extractTextFromDocx = async (file: File): Promise<string> => {
+const extractDataFromDocx = async (file: File): Promise<ExtractedData> => {
   const arrayBuffer = await file.arrayBuffer();
-  const result = await mammoth.extractRawText({ arrayBuffer });
-  return `Content from Word Document (${file.name}):\n${result.value}`;
+  const extractedImages: Array<{ inlineData: { mimeType: string; data: string } }> = [];
+
+  // Custom image converter to extract images out of the HTML flow
+  // to save tokens (native image parts are cheaper than base64 text)
+  const options = {
+    convertImage: mammoth.images.imgElement(function(image: any) {
+      return image.read("base64").then(function(imageBuffer: string) {
+        const mimeType = image.contentType;
+        // Push to our collection
+        extractedImages.push({
+          inlineData: {
+            mimeType: mimeType,
+            data: imageBuffer
+          }
+        });
+        // Return a placeholder in the HTML
+        return {
+          src: "", 
+          alt: `[Extracted Image - Refer to Image Part ${extractedImages.length}]`
+        };
+      });
+    })
+  };
+
+  const result = await mammoth.convertToHtml({ arrayBuffer }, options);
+  
+  return {
+    text: `Content from Word Document (${file.name}) [Format: HTML with extracted images]:\n${result.value}`,
+    images: extractedImages
+  };
 };
 
 const extractTextFromExcel = async (file: File): Promise<string> => {
@@ -32,7 +70,9 @@ const extractTextFromExcel = async (file: File): Promise<string> => {
     const worksheet = workbook.Sheets[sheetName];
     // Convert to CSV for structure preservation
     const csv = XLSX.utils.sheet_to_csv(worksheet);
-    text += `Sheet: ${sheetName}\n${csv}\n\n`;
+    // Limit huge sheets to avoid token limits (arbitrary safety cap of ~50k chars per sheet)
+    const safeCsv = csv.length > 50000 ? csv.substring(0, 50000) + "\n...[Truncated]..." : csv;
+    text += `Sheet: ${sheetName}\n${safeCsv}\n\n`;
   });
   
   return text;
@@ -53,8 +93,13 @@ export const processFiles = async (files: File[], platform: string): Promise<str
 
     if (isDocx) {
       try {
-        const textData = await extractTextFromDocx(file);
-        parts.push({ text: textData });
+        // Updated to extract images separately
+        const { text, images } = await extractDataFromDocx(file);
+        parts.push({ text: text });
+        // Append extracted images as separate parts
+        if (images && images.length > 0) {
+          parts.push(...images);
+        }
       } catch (e) {
         console.error("Failed to parse Word doc", e);
         parts.push({ text: `[Error reading Word file: ${file.name}]` });
@@ -68,7 +113,7 @@ export const processFiles = async (files: File[], platform: string): Promise<str
         parts.push({ text: `[Error reading Excel file: ${file.name}]` });
       }
     } else {
-      // Assume image
+      // Assume image file
       try {
         const base64Data = await getBase64(file);
         parts.push({
@@ -83,11 +128,11 @@ export const processFiles = async (files: File[], platform: string): Promise<str
     }
   }
 
-  // Construct the prompt with platform context
-  let finalPrompt = "Here are the inputs. Please extract the data for EVERY single entry found in these files. Do not summarize. Do not skip any entries. If there are multiple items (e.g. 20 items), you MUST list them ALL. Output the full TSV table.";
+  // Construct the prompt
+  let finalPrompt = "Task: Extract social media data for EVERY entry found in these files.\n\nSOURCE MATERIAL NOTE:\n- Input contains text (HTML/CSV) and images.\n- Word documents have been converted to HTML; images from the docs are attached as separate image inputs. Look for data in both the HTML tables and the attached images.\n\nCRITICAL QUALITY CHECKS:\n1. Look closely at numbers. Do not confuse '8' with '3' or '0'.\n2. Do not summarize. List every single row.\n3. Output ONLY the TSV table.";
   
   if (platform && platform !== 'Auto-detect') {
-    finalPrompt += `\n\nCRITICAL INSTRUCTION: The user has explicitly specified that the platform is **${platform}**.\n1. When identifying the UI, assume it belongs to ${platform}.\n2. When generating the 'Link' column, you MUST prioritize the URL format for ${platform}.\n3. Even if the screenshot looks ambiguous, treat it as ${platform} data.`;
+    finalPrompt += `\n\nPLATFORM CONTEXT: The user specified **${platform}**.\n1. Interpret UI icons based on standard ${platform} interfaces.\n2. Ensure Links follow ${platform} URL patterns.\n3. Verify that 'Followers' and 'Views' counts match typical ${platform} display formats (e.g. check for 'K', 'M', '万').`;
   }
 
   parts.push({
@@ -103,14 +148,18 @@ export const processFiles = async (files: File[], platform: string): Promise<str
       },
       config: {
         systemInstruction: SYSTEM_PROMPT,
-        temperature: 0.1,
-        maxOutputTokens: 8192, // Explicitly allow for longer outputs to prevent truncation
+        temperature: 0.1, // Keep low for factual extraction
+        maxOutputTokens: 8192,
       }
     });
 
     return response.text || "No response text generated.";
-  } catch (error) {
+  } catch (error: any) {
     console.error("Gemini API Error:", error);
+    // Enhance error message for user
+    if (error.message && error.message.includes("token count exceeds")) {
+       throw new Error("The file is too large (too many tokens). Please try splitting the document or removing large images.");
+    }
     throw new Error("Failed to process files. Please try again.");
   }
 };
